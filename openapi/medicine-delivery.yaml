@@ -821,11 +821,14 @@ paths:
                         status: CANCELED
                     tracking: null
         '400':
-          description: '`order_id` is missing.'
+          description: '`order_id` is empty.'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+              example:
+                error: true
+                message: "'Order_id' is required"
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
