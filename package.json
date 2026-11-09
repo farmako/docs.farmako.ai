@@ -1,0 +1,19 @@
+{
+  "name": "docs.farmako.ai",
+  "private": true,
+  "description": "Public API documentation for Farmako, published to https://docs.farmako.ai",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "lint": "redocly lint",
+    "build": "node scripts/build.mjs",
+    "preview": "npm run build && npx --yes serve@14.2.4 dist"
+  },
+  "devDependencies": {
+    "@redocly/cli": "2.71.1",
+    "@scalar/api-reference": "1.76.0",
+    "openapi-to-postmanv2": "6.4.2"
+  }
+}

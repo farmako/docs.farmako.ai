@@ -1,0 +1,1774 @@
+openapi: 3.1.0
+
+info:
+  title: Farmako Medicine Delivery API
+  version: 1.0.0
+  summary: Search Farmako's medicine catalogue, check stock, price baskets and place delivery orders.
+  contact:
+    name: Farmako Tech
+    email: tech@farmako.ai
+  description: |
+    The Medicine Delivery API lets partners search Farmako's medicine catalogue, check stock, price a
+    basket and place, track and cancel delivery orders. Order status updates can also be pushed to you
+    via [webhooks](#tag/webhooks).
+
+    ## Getting access
+
+    Every partner is set up as a **channel** with its own API key. Keys are issued by the Farmako tech
+    team. Write to [tech@farmako.ai](mailto:tech@farmako.ai) to get keys for staging and production. Each
+    environment has its own key.
+
+    ## Environments
+
+    | Environment | Base URL |
+    | --- | --- |
+    | Production | `https://api.farmako.app/public/1.0.0/medicine` |
+    | Staging | `https://api.staging.farmako.app/public/1.0.0/medicine` |
+
+    Build and test against staging, then switch the base URL and key for production.
+
+    ## Authentication
+
+    Send your channel API key as a bearer token on every request:
+
+    ```http
+    Authorization: Bearer <your-api-key>
+    ```
+
+    | Status | Body | Meaning |
+    | --- | --- | --- |
+    | `400` | `{ "message": "API key is missing" }` | No key was sent. |
+    | `403` | `{ "message": "Invalid API Key! Contact tech@farmako.ai" }` | The key is unknown, or belongs to another environment. |
+
+    Keep the key on your server. Never ship it in a mobile app or browser bundle.
+
+    ## Integration flow
+
+    1. **[Search](#tag/inventory/GET/inventory/search)**: find SKUs by keyword and get their `sku_id`.
+    2. **[Check availability](#tag/inventory/POST/inventory/availability)**: confirm the quantity is
+       sellable and whether a prescription is needed.
+    3. **[Quote](#tag/orders/POST/order/mock)**: price the basket and show the customer the final payable amount.
+    4. **[Create](#tag/orders/POST/order/create)**: place the order and store the returned `order_id`.
+    5. **Track**: receive [webhooks](#tag/webhooks), and use
+       [`/order/status`](#tag/orders/POST/order/status) to reconcile.
+
+    ## Amounts
+
+    The order endpoints and `/inventory/availability` accept `amount_format=rupees|paise`. Rupees (the
+    default) return decimals such as `120.50`, paise return integers such as `12050`.
+    **Webhooks always use paise**, so we recommend sending `amount_format=paise` on REST calls too, to keep
+    one unit everywhere. `/inventory/search` always returns rupees.
+
+    ## Conventions
+
+    - Request and response bodies are JSON. Unknown request fields are stripped, not rejected.
+    - Requests are **all-or-nothing**. If one SKU in a basket fails, the whole call fails and names that
+      one SKU. Fix it and call again.
+    - Nothing is reserved until `/order/create` succeeds. Stock can sell out between calls.
+    - Read `message` before retrying a `500`. Some are permanent, for example an unknown `pharmacyId`.
+
+    ## Downloads
+
+    - [Postman collection](medicine-delivery/postman_collection.json): import it into Postman, Insomnia
+      or Bruno, then set `baseUrl` and `bearerToken`.
+    - OpenAPI document: [JSON](medicine-delivery/openapi.json) or [YAML](medicine-delivery/openapi.yaml),
+      for generating clients.
+
+servers:
+  - url: https://api.farmako.app/public/1.0.0/medicine
+    description: Production
+  - url: https://api.staging.farmako.app/public/1.0.0/medicine
+    description: Staging
+
+security:
+  - channelKey: []
+
+tags:
+  - name: Inventory
+    description: Find medicines and check whether they can be fulfilled.
+  - name: Orders
+    description: Quote, place, track and cancel orders.
+  - name: Webhooks
+    description: |
+      Farmako pushes order lifecycle updates to an HTTPS endpoint you host, so you do not have to poll
+      `/order/status`.
+
+      ## Getting set up
+
+      Webhooks are **configured manually by the Farmako tech team**. There is no self-serve API or
+      dashboard. Send the following to your Farmako contact:
+
+      | What | Notes |
+      | --- | --- |
+      | **Endpoint URL** | Must be `https://`. One URL per environment (staging and production are configured separately). |
+      | **Environment** | Staging or production. |
+      | **Contact for delivery failures** | Email or phone for when your endpoint starts erroring. |
+
+      The tech team confirms once the subscription is live. Do not go live before then. To change an
+      endpoint, raise the same request again. A redeploy on your side needs no reconfiguration as long as
+      the URL is unchanged.
+
+      ## Delivery mechanics
+
+      - Events are delivered as `POST` with `Content-Type: application/json`.
+      - **Respond `2xx` immediately** and do the work asynchronously. Slow responses are treated as failures.
+      - **Non-2xx responses are retried.** Your handler must be **idempotent**, because any event can
+        arrive more than once.
+      - **Ordering is not guaranteed.** A later status can arrive before an earlier one. Compare against
+        the status you already hold and ignore backwards transitions.
+      - Delivery is best-effort. `/order/status` remains authoritative. Reconcile against it if you have not
+        heard about an order in a while.
+
+      ## Events
+
+      | `status` | `status_code` | Event type | Meaning |
+      | --- | --- | --- | --- |
+      | `ORDER_PROCESSING` | `VHF01` | `order.fulfillment.processing` | Order accepted. Sent at creation. |
+      | `ORDER_PROCESSED` | `VHF02` | `order.fulfillment.processed` | Billed at the pharmacy. **The only event that carries `invoice_url`.** |
+      | `PACKED` | _(empty)_ | `order.logistics.packed` | Packed and a delivery trip created. No rider assigned yet. |
+      | `ORDER_PICKED` | `VHF03` | `order.logistics.picked` | Rider assigned and parcel collected from the pharmacy. |
+      | `OUT_FOR_DELIVERY` | `VHF04` | `order.logistics.out_for_delivery` | Rider en route to the customer. Carries `eta`. |
+      | `COMPLETE` | `VHF05` | `order.logistics.delivered` | Delivered. Terminal. |
+      | `REJECTED` | _(empty)_ | `order.fulfillment.unknown` | Delivery attempt failed at the door. **Not terminal.** |
+      | `CANCELLED` | `VHF06` | `order.fulfillment.cancelled` | Order cancelled. Terminal. |
+
+      Typical sequence:
+
+      ```text
+      ORDER_PROCESSING → ORDER_PROCESSED → PACKED → ORDER_PICKED → OUT_FOR_DELIVERY → COMPLETE
+      ```
+
+      `CANCELLED` can interrupt any point before the pharmacy bills the order. `REJECTED` can occur in
+      place of `COMPLETE`.
+
+      ### `REJECTED`
+
+      The rider reached the customer but the parcel was not accepted. The parcel returns to the pharmacy
+      and the order is queued for reassignment, so expect another `ORDER_PICKED` / `OUT_FOR_DELIVERY` cycle.
+      **Do not close the order on `REJECTED`.** It is emitted only on multi-drop delivery routes, and only
+      once the rider's route completes, so it can arrive well after the failed attempt.
+
+      ### Fields you must tolerate
+
+      - **`status_code` is empty (`""`) for `PACKED` and `REJECTED`.** Route on `status`, not `status_code`.
+      - **`REJECTED` arrives with event type `order.fulfillment.unknown`.** If you route on event type,
+        this event falls into your default branch. Handle it explicitly.
+      - Treat any unrecognised `status` as informational and ignore it rather than erroring.
+
+      ### Status names differ from `/order/status`
+
+      | State | Webhook | `/order/status` |
+      | --- | --- | --- |
+      | Cancelled | `CANCELLED` (double `L`) | `CANCELED` (single `L`) |
+      | Trip created, no rider | `PACKED` | `ORDER_PROCESSED` |
+      | Failed delivery attempt | `REJECTED` | _(not reported; stays at the previous status)_ |
+
+      Normalise on your side. `/order/status` never returns `PACKED` or `REJECTED`.
+
+      ## Behaviour to expect
+
+      - **Cancellation is terminal and silencing.** Once an order is cancelled, no further events are
+        delivered for it.
+      - **`ORDER_PROCESSED` is the only event with a bill.** Capture `invoice_url` when it arrives. It is
+        not repeated on later events.
+      - **An order can revisit a status.** After `REJECTED`, expect `ORDER_PICKED` and `OUT_FOR_DELIVERY`
+        again for the reattempt.
+      - **Amounts can differ from your quote.** The webhook reflects what was actually billed and
+        dispensed. Reconcile against `invoice_amount`, not the earlier `/order/mock` figure.
+      - **An order rejected at creation produces no webhook at all.** The `/order/create` response is the
+        only signal.
+
+      ## Recommended handler
+
+      1. Return `2xx` at once and queue the body for processing.
+      2. Look up your order by `partner_order_id`.
+      3. Switch on `status`, not `status_code` or event type.
+      4. Ignore the event if the status you already hold is later in the lifecycle, except when the new
+         status is `REJECTED` or `CANCELLED`, which must always be applied.
+      5. On `ORDER_PROCESSED`, download the invoice from `invoice_url` straight away. The link expires 30
+         minutes after the event is generated.
+      6. On `REJECTED`, keep the order open and await the reattempt.
+      7. Close the order only on `COMPLETE` or `CANCELLED`.
+
+paths:
+  /inventory/search:
+    get:
+      tags: [Inventory]
+      operationId: searchInventory
+      summary: Search
+      description: |
+        Search the medicine catalogue by keyword. Returns matching SKUs ranked by relevance. Use it to power
+        a search box or typeahead and to get the `sku_id` values the other endpoints need.
+
+        Send `keyword` plus **either** `pharmacyId` **or** both `latitude` and `longitude`. Mixing the two
+        location forms, or omitting both, is a validation error.
+
+        > **Amounts are always in rupees here.** This endpoint ignores `amount_format`.
+
+        ### Notes
+
+        - **The catalogue is channel-scoped.** Only SKUs enabled for your API key are returned.
+        - **Results are not filtered by live stock** and carry no stock or prescription fields. Call
+          `/inventory/availability` before letting a customer commit to a quantity.
+        - **No pagination.** The full relevance-ranked result set is returned in one array. Truncate
+          client-side for typeaheads.
+        - **Zero matches is `200` with `[]`**, never a `404`.
+        - Send `pharmacyId` to search one specific pharmacy's catalogue. Coordinate lookups resolve to the
+          fulfilment location serving that area and may return a wider catalogue than a single local store
+          holds.
+      parameters:
+        - name: keyword
+          in: query
+          required: true
+          description: Search term, such as a brand name, salt or partial name.
+          schema:
+            type: string
+          example: paracetamol
+        - name: latitude
+          in: query
+          description: Required with `longitude` when `pharmacyId` is not sent.
+          schema:
+            type: number
+            minimum: -90
+            maximum: 90
+          example: 12.9716
+        - name: longitude
+          in: query
+          description: Required with `latitude` when `pharmacyId` is not sent.
+          schema:
+            type: number
+            minimum: -180
+            maximum: 180
+          example: 77.5946
+        - name: pharmacyId
+          in: query
+          description: Search the catalogue of one specific pharmacy instead of a location.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Matching SKUs, most relevant first. `[]` when nothing matches.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SearchResult'
+              example:
+                - medicine_id: SKU12345
+                  medicine_name: Paracetamol 500mg Tablet
+                  content: Paracetamol
+                  manufacturer_name: Acme Pharma
+                  packing_size: strip of 10 tablets
+                  size: 10
+                  mrp: 25.0
+                  medicine_type: drug
+                  dosage_type: ''
+        '400':
+          description: |
+            The query failed validation. Common causes: missing `keyword`, no location supplied, only one of
+            `latitude`/`longitude` supplied, or coordinates out of range.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationError'
+              example:
+                error: Bad Request
+                message: '"keyword" is required'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '412':
+          description: No pharmacy covers the supplied coordinates. No `reason_code` is returned. Match on `message`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: true
+                message: Location is not serviceable.
+        '500':
+          $ref: '#/components/responses/InventoryServerError'
+
+  /inventory/availability:
+    post:
+      tags: [Inventory]
+      operationId: checkAvailability
+      summary: Availability
+      description: |
+        Check whether a set of SKUs can be fulfilled at the requested quantities, and get back MRP, pack size
+        and the maximum sellable quantity for each.
+
+        Use it before quoting or ordering, to gate an add-to-cart or show stock limits on a product page. It
+        does not price the basket (use `/order/mock`) and does not reserve anything.
+
+        A `200` means **every** requested SKU is available at the requested quantity. Any shortfall returns
+        a `412` instead. There is no per-item availability flag to inspect.
+
+        ### Notes
+
+        - **Nothing is reserved.** Stock can sell out between this call and `/order/create`.
+        - **All-or-nothing.** One failing SKU rejects the whole request and only that SKU is named. Checking a
+          large basket may take several round trips.
+        - **A `200` here does not guarantee `/order/create` will succeed.** Order creation applies additional
+          checks, such as whether the pharmacy is operating. Treat availability as a pre-filter.
+        - **`sellable_quantity` is capped at 12 packs** regardless of how much stock exists.
+        - Send `pharmacyId` to check one specific pharmacy. Coordinate lookups resolve to the fulfilment
+          location serving that area.
+      parameters:
+        - $ref: '#/components/parameters/AmountFormat'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AvailabilityRequest'
+            examples:
+              coordinates:
+                summary: By coordinates
+                value:
+                  address_details:
+                    latitude: 12.9716
+                    longitude: 77.5946
+                  order_details:
+                    items:
+                      - sku_id: SKU12345
+                        quantity: 10
+                      - sku_id: SKU67890
+                        quantity: 30
+              pharmacy:
+                summary: At a specific pharmacy
+                value:
+                  address_details:
+                    pharmacyId: '12'
+                  order_details:
+                    items:
+                      - sku_id: SKU12345
+                        quantity: 10
+      responses:
+        '200':
+          description: One entry per requested SKU, in request order. An empty request array returns `[]`.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AvailabilityItem'
+              example:
+                - id: SKU12345
+                  medicine_name: Paracetamol 500mg Tablet
+                  manufacturer_name: Acme Pharma
+                  packing_size: strip of 10 tablets
+                  size: 10
+                  mrp: 25.0
+                  is_rx_required: true
+                  sellable_quantity: 120
+                  medicine_category: generic
+                  content: ''
+                  dosage_type: ''
+                  how_medicine_works: ''
+                  how_to_use: ''
+                  side_effects: ''
+                  alcohol: ''
+                  driving: ''
+                  kidney: ''
+                  lactation: ''
+                  liver: ''
+                  pregnancy: ''
+                  medicine_image: ''
+                  medicine_images: []
+                  alternative_results:
+                    in_stock_count: 0
+                    results: []
+        '400':
+          description: |
+            The body failed validation. `message` is prefixed with the offending field path. Note that
+            `error` is the string `"Bad Request"` here, unlike the other error shapes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationError'
+              example:
+                error: Bad Request
+                message: order_details.items[0].quantity quantity must be a number!
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '412':
+          description: |
+            The check failed. `412` responses here do **not** carry a `reason_code`, so match on `message`:
+
+            | `message` | Meaning |
+            | --- | --- |
+            | `Location is not serviceable.` | No pharmacy covers the supplied coordinates. |
+            | `Medicine "<sku_id>" is not searchable for channel "<channel>"` | The SKU is not enabled for your channel. It will never succeed, so remove it from your catalogue. |
+            | `Invalid quantity for <sku_id>, only allowed multiple of <n>` | Quantity is zero or not a multiple of the pack size. |
+            | `Not enough stock for medicine "<sku_id>"` | Requested quantity exceeds available stock. |
+
+            Invalid-quantity and insufficient-stock errors also return an `item` object. `available_stock` is
+            present only on the insufficient-stock error. Use it to clamp the customer's quantity and retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ItemError'
+              examples:
+                insufficientStock:
+                  summary: Insufficient stock
+                  value:
+                    error: true
+                    message: Not enough stock for medicine "SKU12345"
+                    item:
+                      id: SKU12345
+                      name: Paracetamol 500mg Tablet
+                      salt: Paracetamol
+                      manufacturer: Acme Pharma
+                      size_string: strip of 10 tablets
+                      size: 10
+                      available_stock: 40
+                notServiceable:
+                  summary: Location not serviceable
+                  value:
+                    error: true
+                    message: Location is not serviceable.
+        '500':
+          $ref: '#/components/responses/InventoryServerError'
+
+  /order/mock:
+    post:
+      tags: [Orders]
+      operationId: quoteOrder
+      summary: Quote (mock order)
+      description: |
+        Price an order before placing it. Returns the itemised bill (line items, taxes, discounts, delivery
+        charges and net payable) **without** creating an order, reserving stock or charging anything.
+
+        Use it to show the customer the final payable amount at checkout, then call `/order/create` with the
+        **same body** to place the order.
+
+        > **Send coordinates whenever you have them.** Pricing, serviceability and the fulfilling pharmacy
+        > are resolved from latitude/longitude. Without coordinates a fallback location is used, so the quote
+        > may not reflect the pharmacy that will actually serve your customer.
+
+        ### Notes
+
+        - **Nothing is reserved.** A quote does not hold stock or lock prices. `/order/create` can still fail.
+        - **Quotes are short-lived.** Treat a quote older than a few minutes as stale and re-quote.
+        - **All-or-nothing.** If any SKU fails validation or stock, the whole quote fails with a `412`.
+          Errors that return an `item` object identify exactly one offending SKU, even if several are
+          problematic. Re-quote after each fix.
+      parameters:
+        - $ref: '#/components/parameters/AmountFormat'
+      requestBody:
+        $ref: '#/components/requestBodies/Order'
+      responses:
+        '200':
+          description: The priced quote.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuoteResponse'
+              example:
+                error: false
+                message: Mock Order
+                net_amount: 448.75
+                order_amount: 470.0
+                shipping_charges: 29.0
+                charges:
+                  - index: 0
+                    name_en: Delivery Charges
+                    listed_amount: 29.0
+                    final_amount: 29.0
+                    difference_amount: 0
+                discount: 50.25
+                created_at: '2026-08-21 09:14:02'
+                items:
+                  - - medicine_id: SKU12345
+                      medicine_name: Paracetamol 500mg Tablet
+                      content: Paracetamol
+                      manufacturer_name: Acme Pharma
+                      packing_size: strip of 10 tablets
+                      size: 10
+                      batch: B2411
+                      quantity: 10
+                      mrp: 25.0
+                      amount: 235.0
+                      discount: 25.12
+                      cgst: 5.88
+                      sgst: 5.88
+                      igst: 0
+                      dosage_type: ''
+                      medicine_type: drug
+        '400':
+          description: The body failed validation. `message` names the offending field.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationError'
+              example:
+                error: Bad Request
+                message: quantity must be a number!
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: |
+            Another quote for the same pharmacy is in flight. Quotes are serialised per pharmacy. Retry after
+            a short delay (100–500 ms) with jitter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: true
+                message: Another quote is in progress for this pharmacy. Please retry.
+        '412':
+          description: |
+            The basket cannot be quoted.
+
+            | `message` | Meaning |
+            | --- | --- |
+            | `Location is not serviceable.` | No pharmacy covers the delivery location. |
+            | `Pharmacy is temporarily not taking orders` | The serving pharmacy is offline right now. Retry later. |
+            | `Invalid quantity for <sku_id>, only allowed multiple of <n>` | Quantity is zero or not a multiple of the pack size. Correct it to a multiple of `item.size`. |
+            | `Not enough stock for medicine "<sku_id>"` | The quantity cannot be filled. Reduce it or drop the SKU. |
+
+            The serviceability errors carry `reason_code: "ITEM_UNAVILABLE"` (sic). Match it exactly.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ItemError'
+              examples:
+                notServiceable:
+                  summary: Location not serviceable
+                  value:
+                    error: true
+                    order_state: CANCELLED
+                    reason_code: ITEM_UNAVILABLE
+                    message: Location is not serviceable.
+                invalidQuantity:
+                  summary: Invalid quantity
+                  value:
+                    error: true
+                    message: Invalid quantity for SKU12345, only allowed multiple of 10
+                    item:
+                      id: SKU12345
+                      name: Paracetamol 500mg Tablet
+                      salt: Paracetamol
+                      manufacturer: Acme Pharma
+                      size_string: strip of 10 tablets
+                      size: 10
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /order/create:
+    post:
+      tags: [Orders]
+      operationId: createOrder
+      summary: Create order
+      description: |
+        Place a real order. Creates the order, bills it and starts fulfilment. On `200` the order exists and
+        is queued for the pharmacy. Call `/order/mock` first to show the customer the payable amount. The
+        body is identical, so a quote payload can be resent as-is.
+
+        ### Prescriptions
+
+        Each entry in `prescription_links` may be a publicly fetchable `https://` URL or an inline `data:`
+        URL (for example `data:image/jpeg;base64,...`). Prescriptions are fetched and attached
+        asynchronously. **A prescription that cannot be fetched does not fail the order.** The order is still
+        created, without the prescription. Check that your links are reachable before sending.
+
+        ### After a successful create
+
+        1. The order is created in state `ORDER_PROCESSING`.
+        2. If your channel has a prepaid wallet, the net amount is debited from it at creation.
+        3. The order is billed and handed to the pharmacy.
+        4. If webhooks are configured for your channel, an `ORDER_PROCESSING` event is delivered.
+        5. Track it with `/order/status` using the returned `order_id`.
+
+        ### Notes
+
+        - **No idempotency.** `partner_order_id` is stored but not deduplicated. Two calls with the same
+          `partner_order_id` create two orders and bill twice. Guard against retries on your side, and after
+          a timeout or ambiguous failure reconcile with `/order/status` before resending.
+        - **All-or-nothing.** Any single failing SKU rejects the whole order with a `412`. There are no
+          partial orders, and errors name one offending SKU at a time.
+        - **A `200` is final for creation, not for delivery.** Fulfilment can still fail downstream.
+        - **Billed amounts may differ from the quote** if stock or pricing moved in between. Treat this
+          response, not the quote, as the amount charged.
+      parameters:
+        - $ref: '#/components/parameters/AmountFormat'
+        - name: verify_stock
+          in: query
+          description: |
+            When `true`, the order is rejected if any item is short on stock. When `false`, the order is
+            accepted anyway and the shortfall is reported in the `errors` array of the response.
+          schema:
+            type: boolean
+            default: true
+      requestBody:
+        $ref: '#/components/requestBodies/Order'
+      responses:
+        '200':
+          description: The order was created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateOrderResponse'
+              example:
+                error: false
+                order_state: ACCEPTED
+                partner_order_id: PO-9981
+                order_id: '884231'
+                message: Order Created
+                net_amount: 448.75
+                order_amount: 470.0
+                shipping_charges: 29.0
+                charges:
+                  - index: 0
+                    name_en: Delivery Charges
+                    listed_amount: 29.0
+                    final_amount: 29.0
+                    difference_amount: 0
+                discount: 50.25
+                created_at: '2026-08-21 09:14:02'
+                items:
+                  - - medicine_id: SKU12345
+                      medicine_name: Paracetamol 500mg Tablet
+                      content: Paracetamol
+                      manufacturer_name: Acme Pharma
+                      packing_size: strip of 10 tablets
+                      size: 10
+                      batch: B2411
+                      quantity: 10
+                      mrp: 25.0
+                      amount: 235.0
+                      discount: 25.12
+                      cgst: 5.88
+                      sgst: 5.88
+                      igst: 0
+                      dosage_type: ''
+                      medicine_type: drug
+                errors: []
+        '400':
+          description: The body failed validation. `message` names the offending field.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: true
+                message: quantity must be a number!
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '412':
+          description: |
+            The order was rejected and **nothing was created or billed** (`order_state: "CANCELLED"`).
+            Distinguish by `reason_code`:
+
+            | `reason_code` | `message` | Meaning |
+            | --- | --- | --- |
+            | `DELIVERY_PINCODE_UNSERVICEABLE` | `Location is not serviceable.` | No pharmacy covers the delivery location. |
+            | `ITEM_UNAVILABLE` | `Pharmacy is temporarily not taking orders` | The serving pharmacy is offline, or outside its delivery hours. Retry later. |
+            | `BUYER_ITEM_QTY_UPDATE` | `Invalid quantity for <sku_id>, only allowed multiple of <n>` | Quantity is zero or not a multiple of the pack size. |
+            | `ITEM_UNAVAILABLE` | `Not enough stock for medicine "<sku_id>"` | The quantity cannot be filled. Only returned when `verify_stock=true`. |
+
+            > **`reason_code` spelling is not uniform.** `ITEM_UNAVILABLE` (missing `A`) and
+            > `ITEM_UNAVAILABLE` are two distinct live values with different meanings: pharmacy offline vs out
+            > of stock. Match both literals exactly and do not normalise them.
+
+            The two item-level rejections also return an `item` object. Use `item.size` for the pack multiple.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ItemError'
+              examples:
+                invalidQuantity:
+                  summary: Invalid quantity
+                  value:
+                    error: true
+                    order_state: CANCELLED
+                    reason_code: BUYER_ITEM_QTY_UPDATE
+                    message: Invalid quantity for SKU12345, only allowed multiple of 10
+                    item:
+                      id: SKU12345
+                      name: Paracetamol 500mg Tablet
+                      salt: Paracetamol
+                      manufacturer: Acme Pharma
+                      size_string: strip of 10 tablets
+                      size: 10
+                notServiceable:
+                  summary: Location not serviceable
+                  value:
+                    error: true
+                    order_state: CANCELLED
+                    reason_code: DELIVERY_PINCODE_UNSERVICEABLE
+                    message: Location is not serviceable.
+        '500':
+          description: |
+            The order was not created. `message` may carry a specific cause, so read it before retrying:
+
+            | `message` | Meaning |
+            | --- | --- |
+            | `MOV did not match` | The order value is below your channel's minimum order value. Not transient. Increase the basket. |
+            | `Unable to get user account` | The customer account could not be resolved. Retry. |
+            | `Internal Server Error` | Transient. Retry with backoff, after checking `/order/status`. |
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: true
+                order_state: CANCELLED
+                reason_code: ITEM_UNAVILABLE
+                message: Internal Server Error
+
+  /order/status:
+    post:
+      tags: [Orders]
+      operationId: getOrderStatus
+      summary: Order status
+      description: |
+        Get the current fulfilment status of an order. **Integrate against `current_status`.**
+
+        | Status | Meaning |
+        | --- | --- |
+        | `ORDER_PROCESSING` | Order accepted and queued. The pharmacy has not yet billed or packed it. Initial state of every order. |
+        | `ORDER_PROCESSED` | The pharmacy has billed and packed the order. Awaiting rider pickup. |
+        | `ORDER_PICKED` | A rider is assigned and has picked the order up from the pharmacy. |
+        | `OUT_FOR_DELIVERY` | The rider is en route to the customer. |
+        | `COMPLETE` | Delivered. Terminal. |
+        | `CANCELED` | Cancelled. Terminal. Note the single `L`. Webhooks spell it `CANCELLED`. |
+
+        ```text
+        ORDER_PROCESSING → ORDER_PROCESSED → ORDER_PICKED → OUT_FOR_DELIVERY → COMPLETE
+        ```
+
+        Statuses only move forward.
+
+        ### Reading `events`
+
+        `events` is **not** an audit trail. It holds at most two entries: the base `ORDER_PROCESSING` state
+        and the current state, with no timestamps. `index` is a stage rank (`0`–`4`), not an array position,
+        so values are not contiguous. Do not derive progress by diffing successive `events` arrays.
+
+        ### Courier tracking
+
+        Orders shipped through a courier partner carry a `tracking` block with the AWB, carrier, tracking URL
+        and the courier's scan history. It is `null` for orders delivered by Farmako riders.
+
+        ### Polling
+
+        - Poll no more than once every 30 seconds per order. Prefer [webhooks](#tag/webhooks).
+        - Stop polling once `current_status` is `COMPLETE` or `CANCELED`.
+      requestBody:
+        $ref: '#/components/requestBodies/OrderId'
+      responses:
+        '200':
+          description: The order's current status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+              examples:
+                riderDelivery:
+                  summary: Out for delivery (Farmako rider)
+                  value:
+                    error: false
+                    order_id: '884231'
+                    current_status: OUT_FOR_DELIVERY
+                    events:
+                      - index: 0
+                        status: ORDER_PROCESSING
+                      - index: 3
+                        status: OUT_FOR_DELIVERY
+                    tracking: null
+                courierDelivery:
+                  summary: Delivered (courier)
+                  value:
+                    error: false
+                    order_id: '884231'
+                    current_status: COMPLETE
+                    events:
+                      - index: 0
+                        status: ORDER_PROCESSING
+                      - index: 4
+                        status: COMPLETE
+                    tracking:
+                      provider: shipway
+                      awb: '1234567890123'
+                      carrier_id: '7442'
+                      carrier_name: Delhivery Express (0.5kg)
+                      track_url: https://app-v1.shipway.com/tracking/forward/1234567890123
+                      status: delivered
+                      status_raw: DELIVERED
+                      is_terminal: true
+                      last_activity_at: '2026-08-30T07:47:20.000Z'
+                      last_updated_at: '2026-08-31T04:00:25.265Z'
+                      activities:
+                        - date: '2026-08-30 13:17:19'
+                          activity: Delivered to consignee
+                          location: Hyderabad_Kukatpally_D (Telangana)
+                        - date: '2026-08-30 11:32:41'
+                          activity: Out for delivery
+                          location: Hyderabad_Kukatpally_D (Telangana)
+                cancelled:
+                  summary: Cancelled
+                  value:
+                    error: false
+                    order_id: '884231'
+                    current_status: CANCELED
+                    events:
+                      - index: 0
+                        status: ORDER_PROCESSING
+                      - index: 1
+                        status: CANCELED
+                    tracking: null
+        '400':
+          description: '`order_id` is missing.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/OrderNotFound'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /order/cancel:
+    post:
+      tags: [Orders]
+      operationId: cancelOrder
+      summary: Cancel order
+      description: |
+        Cancel an order that has not been billed yet.
+
+        An order can be cancelled only while **both** of these hold:
+
+        - it was created **less than 1 hour ago**, and
+        - the pharmacy has **not billed it yet** (`current_status` is still `ORDER_PROCESSING`).
+
+        **Most outcomes return `200`, so read `message`, not just the status code:**
+
+        | `error` | `message` | Meaning |
+        | --- | --- | --- |
+        | `false` | `Order Cancelled Successfully` | Cancelled now. A `CANCELLED` webhook is sent. |
+        | `false` | `Order Already Cancelled` | It was already cancelled. Safe to treat as success. |
+        | `false` | `Order is already processed, can't cancel now.` | **Not cancelled.** The pharmacy has billed the order. |
+        | `true` | `Order can't be cancelled.` | **Not cancelled.** The 1-hour cancellation window has passed. |
+
+        Cancelling an already-cancelled order is idempotent.
+      requestBody:
+        $ref: '#/components/requestBodies/OrderId'
+      responses:
+        '200':
+          description: The request was processed. Check `message` to see whether the order was cancelled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelResponse'
+              examples:
+                cancelled:
+                  summary: Cancelled
+                  value:
+                    error: false
+                    order_id: '884231'
+                    message: Order Cancelled Successfully
+                alreadyCancelled:
+                  summary: Already cancelled
+                  value:
+                    error: false
+                    order_id: '884231'
+                    message: Order Already Cancelled
+                alreadyBilled:
+                  summary: Not cancelled, already billed
+                  value:
+                    error: false
+                    order_id: '884231'
+                    message: Order is already processed, can't cancel now.
+                windowPassed:
+                  summary: Not cancelled, window passed
+                  value:
+                    error: true
+                    order_id: '884231'
+                    message: Order can't be cancelled.
+        '400':
+          description: '`order_id` is empty.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: true
+                message: "'Order_id' is required"
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/OrderNotFound'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+webhooks:
+  orderStatus:
+    post:
+      tags: [Webhooks]
+      operationId: orderStatusWebhook
+      summary: Order status event
+      description: |
+        Sent to your endpoint on each order lifecycle change. The body is the order snapshot at the time of
+        the event. See [Webhooks](#tag/webhooks) for setup, the event list and delivery behaviour.
+
+        > **All amounts are in paise (integer minor units).** `44875` means ₹448.75. Webhooks have no
+        > `amount_format` option.
+
+        ### Invoice URL
+
+        `invoice_url` is a pre-signed link that is **valid for 30 minutes from the moment the
+        `ORDER_PROCESSED` event was generated**, not from when you fetch it.
+
+        - **Download the PDF on receipt** and store the file. Do not keep the URL as your record of the invoice.
+        - The link is not renewed. `ORDER_PROCESSED` is sent once per order, and `/order/status` does not
+          return `invoice_url`.
+        - If a link has expired and you no longer have the PDF, ask Farmako Operations for a fresh one, quoting
+          `invoice_no`.
+        - Treat the URL as a credential. Do not log it or expose it to end users.
+
+        ### ETA
+
+        | Event | `eta` |
+        | --- | --- |
+        | `ORDER_PROCESSING`, `ORDER_PROCESSED`, `CANCELLED` | `null` |
+        | `PACKED`, `ORDER_PICKED`, `OUT_FOR_DELIVERY` | Estimated delivery time. Most accurate on `OUT_FOR_DELIVERY`. |
+        | `COMPLETE` | Present but not an estimate. Treat it as the delivery time. |
+        | `REJECTED` | Empty string. |
+
+        ETAs are re-estimated on every event, so always use the latest one.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderStatusEvent'
+            example:
+              status: OUT_FOR_DELIVERY
+              status_code: VHF04
+              partner_order_id: PO-9981
+              partner_booking_id: PO-9981
+              store_fulfillmentId: ''
+              delivery_fulfillmentId: ''
+              invoice_no: '884231'
+              invoice_url: null
+              invoice_amount: 44875
+              items_amount: 47000
+              discount_amount: 5025
+              delivery_charge: 2900
+              cash_on_delivery: 0
+              eta: '2026-08-21T15:42:00Z'
+              charges:
+                - item_type: charge
+                  item_name: Shipping Charge
+                  amount: 2900
+                  discount: 0
+                  quantity: 1
+              order_items:
+                - item_type: inventory
+                  item_name: Paracetamol 500mg Tablet
+                  medicine_id: SKU12345
+                  manufacturer: Acme Pharma
+                  batch: B2411
+                  expiry_date: '2027-04-30'
+                  size_string: strip of 10 tablets
+                  size: 10
+                  mrp_pack: 2500
+                  quantity: 10
+                  amount: 23500
+                  discount: 2512
+      responses:
+        '2XX':
+          description: Acknowledge receipt immediately. Any non-2xx response is retried.
+
+components:
+  securitySchemes:
+    channelKey:
+      type: http
+      scheme: bearer
+      description: Your channel API key, issued by Farmako. Each environment has its own key.
+
+  parameters:
+    AmountFormat:
+      name: amount_format
+      in: query
+      description: |
+        Unit for every amount in the response. `rupees` returns decimals (`120.50`), `paise` returns integers
+        (`12050`). Use `paise` to match webhook payloads.
+      schema:
+        type: string
+        enum: [rupees, paise]
+        default: rupees
+
+  requestBodies:
+    Order:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OrderRequest'
+          examples:
+            coordinates:
+              summary: Address with coordinates (recommended)
+              value:
+                partner_order_id: PO-9981
+                remark: Customer prefers evening delivery
+                customer_details:
+                  name: Asha Menon
+                  mobile: '9876543210'
+                  gender: female
+                  age: 34
+                  email: asha@example.com
+                  address_details:
+                    address: 12 MG Road, Bengaluru
+                    latitude: 12.9716
+                    longitude: 77.5946
+                order_details:
+                  prescription_links:
+                    - https://cdn.example.com/rx/9981.jpg
+                  items:
+                    - sku_id: SKU12345
+                      quantity: 10
+            pincode:
+              summary: Address with pincode only
+              value:
+                partner_order_id: PO-9982
+                customer_details:
+                  name: Asha Menon
+                  mobile: '9876543210'
+                  gender: female
+                  age: 34
+                  email: asha@example.com
+                  address_details:
+                    address: 12 MG Road, Bengaluru
+                    pincode: 560001
+                order_details:
+                  prescription_links: []
+                  items:
+                    - sku_id: SKU12345
+                      quantity: 10
+
+    OrderId:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [order_id]
+            properties:
+              order_id:
+                type: string
+                description: The `order_id` returned by `/order/create`.
+          example:
+            order_id: '884231'
+
+  responses:
+    Forbidden:
+      description: The API key is invalid, or belongs to a different environment. (A missing key returns `400`.)
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              message:
+                type: string
+          example:
+            message: Invalid API Key! Contact tech@farmako.ai
+
+    OrderNotFound:
+      description: |
+        The order does not exist, or does not belong to your API key. Orders are scoped per channel, so you
+        can only see your own.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: boolean
+                const: true
+              order_id:
+                type: string
+              status:
+                type: string
+                const: Order Not Found
+          example:
+            error: true
+            order_id: '884231'
+            status: Order Not Found
+
+    ServerError:
+      description: Transient failure. Retry with backoff.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: true
+            message: Internal Server Error
+
+    InventoryServerError:
+      description: |
+        | `message` | Meaning |
+        | --- | --- |
+        | `Invalid pharmacy ID. No matching pharmacy found.` | The `pharmacyId` you sent does not exist. **Not transient.** Fix the ID rather than retrying. |
+        | anything else | Transient. Retry with backoff. |
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            unknownPharmacy:
+              summary: Unknown pharmacyId
+              value:
+                error: true
+                order_state: CANCELLED
+                reason_code: ITEM_UNAVILABLE
+                message: Invalid pharmacy ID. No matching pharmacy found.
+            transient:
+              summary: Transient failure
+              value:
+                error: true
+                message: Internal Server Error
+
+  schemas:
+    Amount:
+      type: number
+      description: Rupees (decimal) or paise (integer), depending on `amount_format`.
+
+    CoordinatesAddress:
+      title: Coordinates
+      type: object
+      required: [address, latitude, longitude]
+      properties:
+        address:
+          type: string
+          maxLength: 180
+          description: Full delivery address. The order is delivered to this text.
+        latitude:
+          type: number
+          minimum: -90
+          maximum: 90
+        longitude:
+          type: number
+          minimum: -180
+          maximum: 180
+
+    PincodeAddress:
+      title: Pincode
+      type: object
+      required: [address, pincode]
+      properties:
+        address:
+          type: string
+          maxLength: 180
+          description: Full delivery address.
+        pincode:
+          type: integer
+          description: |
+            6-digit Indian pincode. The first digit is `1`–`8` (postal region) or `9` (Army Postal Service).
+            Without coordinates a fallback location picks the pharmacy, so the order may be routed away from
+            the customer's actual area.
+          minimum: 100000
+          maximum: 999999
+
+    Customer:
+      type: object
+      required: [name, mobile, gender, age, email, address_details]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        mobile:
+          type: string
+          description: A valid Indian mobile number. Identifies the customer account.
+        gender:
+          type: string
+          minLength: 1
+        age:
+          type: number
+        email:
+          type: string
+          minLength: 1
+        address_details:
+          description: Send coordinates whenever you have them.
+          oneOf:
+            - $ref: '#/components/schemas/CoordinatesAddress'
+            - $ref: '#/components/schemas/PincodeAddress'
+
+    ItemRequest:
+      type: object
+      required: [sku_id, quantity]
+      properties:
+        sku_id:
+          type: string
+          description: The `medicine_id` returned by `/inventory/search`.
+        quantity:
+          type: number
+          description: Units. Must be a positive multiple of the SKU's pack `size`.
+
+    OrderRequest:
+      type: object
+      required: [partner_order_id, customer_details, order_details]
+      properties:
+        partner_order_id:
+          type: string
+          minLength: 1
+          description: Your order reference. Echoed back and on every webhook. **Not** deduplicated.
+        remark:
+          type: string
+          description: Free text, attached to the order for the fulfilment team.
+        store_fulfillmentId:
+          type: string
+          description: Optional reference of yours, echoed on webhooks.
+        delivery_fulfillmentId:
+          type: string
+          description: Optional reference of yours, echoed on webhooks.
+        customer_details:
+          $ref: '#/components/schemas/Customer'
+        order_details:
+          type: object
+          required: [prescription_links, items]
+          properties:
+            prescription_links:
+              type: array
+              description: Public `https://` URLs or `data:` URLs of prescription images or PDFs. May be empty.
+              items:
+                type: string
+            items:
+              type: array
+              minItems: 1
+              items:
+                $ref: '#/components/schemas/ItemRequest'
+
+    AvailabilityRequest:
+      type: object
+      required: [address_details, order_details]
+      properties:
+        address_details:
+          description: Supply exactly one of coordinates or `pharmacyId`.
+          oneOf:
+            - title: Coordinates
+              type: object
+              required: [latitude, longitude]
+              properties:
+                latitude:
+                  type: number
+                  minimum: -90
+                  maximum: 90
+                longitude:
+                  type: number
+                  minimum: -180
+                  maximum: 180
+            - title: Pharmacy
+              type: object
+              required: [pharmacyId]
+              properties:
+                pharmacyId:
+                  type: string
+                  description: Check stock at this specific pharmacy.
+        order_details:
+          type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/ItemRequest'
+
+    SearchResult:
+      type: object
+      properties:
+        medicine_id:
+          type: string
+          description: The `sku_id` to pass to `/inventory/availability`, `/order/mock` and `/order/create`.
+        medicine_name:
+          type: string
+        content:
+          type: string
+          description: Salt / composition.
+        manufacturer_name:
+          type: string
+        packing_size:
+          type: string
+          description: Human-readable pack, for example `strip of 10 tablets`.
+        size:
+          type: number
+          description: Units per pack. Order quantities must be a multiple of this.
+        mrp:
+          type: number
+          description: |
+            MRP per pack, in rupees. The highest MRP across in-stock batches, falling back to the catalogue MRP
+            when there is no stock. Indicative only. The billed amount comes from `/order/mock` or `/order/create`.
+        medicine_type:
+          type: string
+          description: Product classification, for example `drug`.
+        dosage_type:
+          type: string
+          description: Reserved. Currently always empty.
+
+    AvailabilityItem:
+      type: object
+      properties:
+        id:
+          type: string
+          description: The `sku_id` you sent.
+        medicine_name:
+          type: string
+        manufacturer_name:
+          type: string
+        packing_size:
+          type: string
+        size:
+          type: number
+          description: Units per pack. Every quantity you send must be a multiple of this.
+        mrp:
+          $ref: '#/components/schemas/Amount'
+          description: Highest MRP per pack across the batches allocated for this check.
+        is_rx_required:
+          type: boolean
+          description: '`true` if a prescription is needed. Collect one before calling `/order/create`.'
+        sellable_quantity:
+          type: number
+          description: |
+            **Maximum units orderable right now**: the lesser of live stock and 12 packs. Use it as the upper
+            bound on quantity selectors.
+        medicine_category:
+          type: string
+          description: Currently always `generic`.
+        content:
+          type: string
+          description: Reserved. Not populated yet.
+        dosage_type:
+          type: string
+          description: Reserved. Not populated yet.
+        how_medicine_works:
+          type: string
+          description: Reserved. Not populated yet.
+        how_to_use:
+          type: string
+          description: Reserved. Not populated yet.
+        side_effects:
+          type: string
+          description: Reserved. Not populated yet.
+        alcohol:
+          type: string
+          description: Reserved. Not populated yet.
+        driving:
+          type: string
+          description: Reserved. Not populated yet.
+        kidney:
+          type: string
+          description: Reserved. Not populated yet.
+        lactation:
+          type: string
+          description: Reserved. Not populated yet.
+        liver:
+          type: string
+          description: Reserved. Not populated yet.
+        pregnancy:
+          type: string
+          description: Reserved. Not populated yet.
+        medicine_image:
+          type: string
+          description: Reserved. Not populated yet.
+        medicine_images:
+          type: array
+          description: Reserved. Not populated yet.
+          items: {}
+        alternative_results:
+          type: object
+          description: Reserved. Not populated yet.
+
+    Charge:
+      type: object
+      properties:
+        index:
+          type: number
+          description: Position in the array.
+        name_en:
+          type: string
+          description: Display label, for example `Delivery Charges`.
+        listed_amount:
+          $ref: '#/components/schemas/Amount'
+          description: The charge before its discount.
+        final_amount:
+          $ref: '#/components/schemas/Amount'
+          description: The charge after its discount. This is what is billed.
+        difference_amount:
+          $ref: '#/components/schemas/Amount'
+          description: Discount on this charge (`listed_amount − final_amount`).
+
+    BilledItem:
+      type: object
+      properties:
+        medicine_id:
+          type: string
+          description: The `sku_id` you sent.
+        medicine_name:
+          type: string
+        content:
+          type: string
+          description: Salt / composition.
+        manufacturer_name:
+          type: string
+        packing_size:
+          type: string
+        size:
+          type: number
+          description: Units per pack.
+        batch:
+          type: string
+          description: Batch allocated. On a quote this is not reserved.
+        quantity:
+          type: number
+          description: Units.
+        mrp:
+          $ref: '#/components/schemas/Amount'
+          description: MRP per pack.
+        amount:
+          $ref: '#/components/schemas/Amount'
+          description: Line amount, inclusive of tax.
+        discount:
+          $ref: '#/components/schemas/Amount'
+          description: Discount on this line.
+        cgst:
+          $ref: '#/components/schemas/Amount'
+          description: Intra-state supplies fill CGST + SGST.
+        sgst:
+          $ref: '#/components/schemas/Amount'
+        igst:
+          $ref: '#/components/schemas/Amount'
+          description: Inter-state supplies fill IGST.
+        dosage_type:
+          type: string
+          description: Currently always empty.
+        medicine_type:
+          type: string
+          description: Currently always `drug`.
+
+    QuoteResponse:
+      type: object
+      properties:
+        error:
+          type: boolean
+          const: false
+        message:
+          type: string
+          description: '`Mock Order` on a quote, `Order Created` on a create.'
+        order_amount:
+          $ref: '#/components/schemas/Amount'
+          description: Cart total before discounts and charges.
+        discount:
+          $ref: '#/components/schemas/Amount'
+          description: Total discount across items.
+        shipping_charges:
+          $ref: '#/components/schemas/Amount'
+          description: Sum of all `charges`, before their discounts.
+        net_amount:
+          $ref: '#/components/schemas/Amount'
+          description: '**Final payable.** Show this figure to the customer.'
+        charges:
+          type: array
+          items:
+            $ref: '#/components/schemas/Charge'
+        created_at:
+          type: string
+          description: Quote timestamp, `YYYY-MM-DD HH:MM:SS` (UTC).
+        items:
+          type: array
+          description: |
+            An **array of arrays**: each line item is wrapped in its own single-element array. Flatten one
+            level before rendering.
+          items:
+            type: array
+            items:
+              $ref: '#/components/schemas/BilledItem'
+
+    CreateOrderResponse:
+      allOf:
+        - $ref: '#/components/schemas/QuoteResponse'
+        - type: object
+          properties:
+            order_state:
+              type: string
+              const: ACCEPTED
+            order_id:
+              type: string
+              description: |
+                **Farmako order ID. Persist it.** It is the key for `/order/status` and `/order/cancel`, and
+                arrives as `invoice_no` on webhooks.
+            partner_order_id:
+              type: string
+              description: Echoes your reference.
+            errors:
+              type: array
+              description: |
+                Per-item issues that did not block creation. Empty on a clean order. Populated when
+                `verify_stock=false` and an item was short. Log the raw contents and reconcile against
+                `/order/status`.
+              items: {}
+
+    StatusResponse:
+      type: object
+      properties:
+        error:
+          type: boolean
+          const: false
+        order_id:
+          type: string
+        current_status:
+          type: string
+          description: The authoritative status. Integrate against this.
+          enum: [ORDER_PROCESSING, ORDER_PROCESSED, ORDER_PICKED, OUT_FOR_DELIVERY, COMPLETE, CANCELED]
+        events:
+          type: array
+          description: The base state plus the current state. Not an audit trail.
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+                description: Stage rank (`0`–`4`), not an array position.
+              status:
+                type: string
+        tracking:
+          description: Courier tracking for courier-shipped orders. `null` for Farmako rider deliveries.
+          oneOf:
+            - $ref: '#/components/schemas/Tracking'
+            - type: 'null'
+
+    Tracking:
+      type: object
+      properties:
+        provider:
+          type: string
+          description: Courier aggregator, for example `shipway`.
+        awb:
+          type: string
+          description: Air waybill number.
+        carrier_id:
+          type: [string, 'null']
+        carrier_name:
+          type: [string, 'null']
+        track_url:
+          type: [string, 'null']
+          description: Public tracking page you can show the customer.
+        status:
+          type: string
+          description: Normalised courier status, for example `delivered`.
+        status_raw:
+          type: [string, 'null']
+          description: The courier's own status text.
+        is_terminal:
+          type: boolean
+        last_activity_at:
+          type: [string, 'null']
+          format: date-time
+        last_updated_at:
+          type: [string, 'null']
+          format: date-time
+        activities:
+          type: array
+          description: Courier scan history, newest first.
+          items:
+            type: object
+            properties:
+              date:
+                type: string
+              activity:
+                type: string
+              location:
+                type: string
+
+    CancelResponse:
+      type: object
+      properties:
+        error:
+          type: boolean
+        order_id:
+          type: string
+        message:
+          type: string
+          enum:
+            - Order Cancelled Successfully
+            - Order Already Cancelled
+            - Order is already processed, can't cancel now.
+            - Order can't be cancelled.
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: boolean
+          const: true
+        message:
+          type: string
+          description: What went wrong. Read it before retrying.
+        order_state:
+          type: string
+          description: '`CANCELLED` when an order call was rejected. No order was created.'
+        reason_code:
+          type: string
+          description: Machine-readable reason. Spellings are not uniform, so match literals exactly.
+
+    ValidationError:
+      type: object
+      properties:
+        error:
+          type: string
+          const: Bad Request
+        message:
+          type: string
+          description: Names the offending field.
+
+    ItemError:
+      allOf:
+        - $ref: '#/components/schemas/Error'
+        - type: object
+          properties:
+            item:
+              type: object
+              description: The single offending SKU.
+              properties:
+                id:
+                  type: string
+                name:
+                  type: string
+                salt:
+                  type: string
+                manufacturer:
+                  type: string
+                size_string:
+                  type: string
+                size:
+                  type: number
+                  description: Pack size. Quantities must be a multiple of this.
+                available_stock:
+                  type: number
+                  description: Only on insufficient-stock errors from `/inventory/availability`.
+
+    OrderStatusEvent:
+      type: object
+      properties:
+        status:
+          type: string
+          description: The lifecycle status. **Route on this.**
+          enum:
+            - ORDER_PROCESSING
+            - ORDER_PROCESSED
+            - PACKED
+            - ORDER_PICKED
+            - OUT_FOR_DELIVERY
+            - COMPLETE
+            - REJECTED
+            - CANCELLED
+        status_code:
+          type: string
+          description: '`VHF01`–`VHF06`, or `""` for `PACKED` and `REJECTED`.'
+        partner_order_id:
+          type: string
+          description: Your reference, as sent to `/order/create`. **Use this to match the order.**
+        partner_booking_id:
+          type: string
+          description: Duplicate of `partner_order_id`, kept for compatibility.
+        invoice_no:
+          type: string
+          description: The Farmako `order_id`, as returned by `/order/create`.
+        invoice_url:
+          type: [string, 'null']
+          description: |
+            Pre-signed invoice PDF link. Present on `ORDER_PROCESSED` only, `null` otherwise. Expires 30 minutes
+            after the event, so download it immediately.
+        invoice_amount:
+          type: integer
+          description: Net payable in paise. The sum of all lines after discount.
+        items_amount:
+          type: integer
+          description: Medicine lines before discount, in paise.
+        discount_amount:
+          type: integer
+          description: Total discount across medicine lines, in paise.
+        delivery_charge:
+          type: integer
+          description: Shipping charge after its discount, in paise.
+        cash_on_delivery:
+          type: integer
+          description: Currently always `0`.
+        store_fulfillmentId:
+          type: string
+          description: Echoes the value sent at create, or `""`.
+        delivery_fulfillmentId:
+          type: string
+          description: Echoes the value sent at create, or `""`.
+        eta:
+          type: [string, 'null']
+          description: Estimated delivery time on logistics events. See the ETA table above.
+        cancellation_reason:
+          type: string
+          description: |
+            **Only on `CANCELLED`.** Currently always the literal `ITEM_UNAVAILABLE`, whatever the real cause,
+            including partner-requested cancellations. Do not show it to customers.
+        charges:
+          type: array
+          description: Charge lines. May carry extra fields. Ignore unknown fields.
+          items:
+            type: object
+            properties:
+              item_type:
+                type: string
+                const: charge
+              item_name:
+                type: string
+              amount:
+                type: integer
+                description: Charge in paise, before discount.
+              discount:
+                type: integer
+                description: Discount on the charge, in paise.
+              quantity:
+                type: integer
+        order_items:
+          type: array
+          description: Medicine lines. May carry extra fields. Ignore unknown fields.
+          items:
+            type: object
+            properties:
+              item_type:
+                type: string
+                const: inventory
+              item_name:
+                type: string
+              medicine_id:
+                type: string
+                description: The `sku_id` you ordered.
+              manufacturer:
+                type: string
+              batch:
+                type: string
+                description: Batch dispensed.
+              expiry_date:
+                type: string
+                description: Batch expiry.
+              size_string:
+                type: string
+              size:
+                type: number
+                description: Units per pack.
+              mrp_pack:
+                type: integer
+                description: MRP per pack, in paise.
+              quantity:
+                type: number
+                description: Units dispensed.
+              amount:
+                type: integer
+                description: Line amount in paise, inclusive of tax.
+              discount:
+                type: integer
+                description: Line discount in paise.

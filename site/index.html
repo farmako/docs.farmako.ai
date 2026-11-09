@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Farmako API Docs</title>
+    <meta name="description" content="Farmako Medicine Delivery API: search medicines, check stock, quote, place and track delivery orders." />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <!-- Scalar API Reference, vendored at build time (pinned in package.json). -->
+    <script src="scalar/standalone.js"></script>
+    <script>
+      Scalar.createApiReference('#app', {
+        url: 'medicine-delivery/openapi.json',
+        title: 'Farmako Medicine Delivery API',
+        favicon: 'favicon.svg',
+        layout: 'modern',
+        theme: 'default',
+        // Calls go straight from the browser to the API (it allows cross-origin requests),
+        // so API keys never pass through a third-party proxy.
+        defaultHttpClient: { targetKey: 'shell', clientKey: 'curl' },
+        authentication: { preferredSecurityScheme: 'channelKey' },
+        persistAuth: false,
+        documentDownloadType: 'both',
+        hideModels: true,
+        showDeveloperTools: 'never',
+        telemetry: false,
+        // Scalar's hosted AI assistant and MCP features send the spec to Scalar's servers; keep them off.
+        agent: { disabled: true },
+        mcp: { disabled: true },
+        defaultOpenAllTags: true,
+      })
+    </script>
+  </body>
+</html>

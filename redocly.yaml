@@ -1,0 +1,17 @@
+# Lint rules for the public API specs. Run with `npm run lint`.
+apis:
+  medicine-delivery:
+    root: openapi/medicine-delivery.yaml
+
+extends:
+  - recommended
+
+rules:
+  # The API is proprietary; partners get access through their agreement with Farmako.
+  info-license: off
+  # Every operation has an id; summaries double as sidebar titles.
+  operation-operationId: error
+  operation-summary: error
+  # Errors such as 403/404/500 are documented once and reused.
+  operation-4xx-response: warn
+  no-unused-components: error
