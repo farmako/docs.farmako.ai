@@ -821,7 +821,8 @@ paths:
                         status: CANCELED
                     tracking: null
         '400':
-          description: '`order_id` is empty.'
+          description: |
+            `order_id` is missing, `null` or blank (empty or only spaces). Nothing is looked up or changed.
           content:
             application/json:
               schema:
@@ -894,7 +895,8 @@ paths:
                     order_id: '884231'
                     message: Order can't be cancelled.
         '400':
-          description: '`order_id` is empty.'
+          description: |
+            `order_id` is missing, `null` or blank (empty or only spaces). Nothing is looked up or changed.
           content:
             application/json:
               schema:
@@ -1066,7 +1068,10 @@ components:
             properties:
               order_id:
                 type: string
-                description: The `order_id` returned by `/order/create`.
+                minLength: 1
+                description: |
+                  The `order_id` returned by `/order/create`. Required: a missing, `null` or blank value returns
+                  `400` with `'Order_id' is required`.
           example:
             order_id: '884231'
 
